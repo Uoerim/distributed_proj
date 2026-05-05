@@ -93,7 +93,10 @@ def main() -> None:
     # -- 4. Run load test ------------------------------------------------
     from client.load_generator import run_load_test
 
-    run_load_test(scheduler, num_users=num_users)
+    
+    for users in [100, 500, 1000]:
+        logger.info("\n🔥 Running test with %d users\n", users)
+        run_load_test(scheduler, num_users=users)
 
     # -- 5. Print detailed report ----------------------------------------
     scheduler.print_report()
