@@ -195,11 +195,117 @@ class Scheduler:
         # Event callbacks – invoked after every dispatch completes
         self._on_complete_callbacks: List[Callable[[Request, Response], None]] = []
 
+        # Health monitoring (Phase 3 - Fault Tolerance)
+        self._health_monitor_thread: Optional[threading.Thread] = None
+        self._monitor_active: bool = False
+        self._failed_workers: Dict[int, float] = {}
+        self._worker_pool_cache: Dict[int, Any] = {}
+        self._check_interval: float = 2.0
+        self._recovery_retry_interval: float = 10.0
+
         logger.info(
             "Scheduler initialised  |  lb=%r  max_retries=%d",
             self._lb,
             self._max_retries,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Health Monitoring (Phase 3 - Fault Tolerance)
+    # ------------------------------------------------------------------ #
+
+    def start_health_monitor(self, check_interval: float = 2.0, recovery_retry_interval: float = 10.0) -> None:
+        if self._monitor_active:
+            logger.warning("Health monitor already running.")
+            return
+        self._monitor_active = True
+        self._check_interval = check_interval
+        self._recovery_retry_interval = recovery_retry_interval
+        self._health_monitor_thread = threading.Thread(
+            target=self._health_monitor_loop,
+            daemon=True,
+            name="SchedulerHealthMonitor"
+        )
+        self._health_monitor_thread.start()
+        logger.info("Health monitor started (interval=%.1fs)", check_interval)
+
+    def stop_health_monitor(self) -> None:
+        if not self._monitor_active:
+            return
+        self._monitor_active = False
+        if self._health_monitor_thread:
+            self._health_monitor_thread.join(timeout=5.0)
+        logger.info("Health monitor stopped.")
+
+    def _health_monitor_loop(self) -> None:
+        while self._monitor_active:
+            try:
+                self._cache_worker_pool()
+                self._check_worker_health()
+                self._attempt_worker_recovery()
+            except Exception as exc:
+                logger.error("Error in health monitor loop: %s", exc)
+            time.sleep(self._check_interval)
+
+    def _cache_worker_pool(self) -> None:
+        with self._lock:
+            for worker_id in self._lb.worker_ids:
+                if worker_id not in self._worker_pool_cache:
+                    for w in self._lb._workers:
+                        if w.id == worker_id:
+                            self._worker_pool_cache[worker_id] = w
+                            break
+
+    def _check_worker_health(self) -> None:
+        with self._lock:
+            active_worker_ids = list(self._lb.worker_ids)
+        
+        for worker_id in active_worker_ids:
+            if worker_id in self._worker_pool_cache:
+                worker = self._worker_pool_cache[worker_id]
+                try:
+                    if not worker.is_healthy():
+                        self._fail_worker(worker_id)
+                except Exception as exc:
+                    logger.warning("Health check failed for worker %d: %s", worker_id, exc)
+                    self._fail_worker(worker_id)
+
+    def _attempt_worker_recovery(self) -> None:
+        now = time.time()
+        failed_ids = list(self._failed_workers.keys())
+        
+        for worker_id in failed_ids:
+            time_failed = self._failed_workers[worker_id]
+            if now - time_failed >= self._recovery_retry_interval:
+                if worker_id in self._worker_pool_cache:
+                    worker = self._worker_pool_cache[worker_id]
+                    try:
+                        if worker.is_healthy():
+                            self._recover_worker(worker_id)
+                    except Exception as exc:
+                        logger.debug("Recovery check failed for worker %d: %s", worker_id, exc)
+
+    def _fail_worker(self, worker_id: int) -> None:
+        if worker_id in self._failed_workers:
+            return
+        with self._lock:
+            self._lb.deregister_worker(worker_id)
+        self._failed_workers[worker_id] = time.time()
+        logger.warning("[Health] Worker %d failed and deregistered. Remaining: %d", 
+                      worker_id, self._lb.worker_count)
+
+    def _recover_worker(self, worker_id: int) -> None:
+        if worker_id not in self._failed_workers:
+            return
+        if worker_id in self._worker_pool_cache:
+            worker = self._worker_pool_cache[worker_id]
+            with self._lock:
+                self._lb.register_worker(worker)
+            del self._failed_workers[worker_id]
+            logger.info("[Health] Worker %d recovered and re-registered. Active: %d", 
+                       worker_id, self._lb.worker_count)
+
+    def get_failed_workers(self) -> Dict[int, float]:
+        return dict(self._failed_workers)
 
     # ------------------------------------------------------------------ #
     #  Callback Registration

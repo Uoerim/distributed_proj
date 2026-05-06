@@ -90,10 +90,16 @@ def main() -> None:
 
     scheduler = Scheduler(lb)
 
+    # -- 3a. Start Health Monitor (Phase 3 - Fault Tolerance) -----------
+    scheduler.start_health_monitor(check_interval=2.0, recovery_retry_interval=10.0)
+
     # -- 4. Run load test ------------------------------------------------
     from client.load_generator import run_load_test
 
     run_load_test(scheduler, num_users=num_users)
+
+    # -- 4a. Stop Health Monitor ------------------------------------------
+    scheduler.stop_health_monitor()
 
     # -- 5. Print detailed report ----------------------------------------
     scheduler.print_report()
