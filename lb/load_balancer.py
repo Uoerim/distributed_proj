@@ -207,6 +207,9 @@ class LoadBalancer:
         # Connection tracking (Least-Connections, Phase 3)
         self._connections = _ConnectionTracker()
 
+        # Request tracking for fault tolerance (Phase 3)
+        self._request_to_worker: Dict[str, int] = {}
+
         # Thread safety
         self._lock = threading.Lock()
 
@@ -275,6 +278,18 @@ class LoadBalancer:
         """Sorted list of active worker identifiers."""
         with self._lock:
             return sorted(w.id for w in self._workers)
+
+    def track_request(self, request_uid: str, worker_id: int) -> None:
+        with self._lock:
+            self._request_to_worker[request_uid] = worker_id
+
+    def untrack_request(self, request_uid: str) -> None:
+        with self._lock:
+            self._request_to_worker.pop(request_uid, None)
+
+    def get_requests_on_worker(self, worker_id: int) -> List[str]:
+        with self._lock:
+            return [uid for uid, wid in self._request_to_worker.items() if wid == worker_id]
 
     # ------------------------------------------------------------------ #
     #  Strategy Management
@@ -352,7 +367,9 @@ class LoadBalancer:
 
         # --- Forward to worker -------------------------------------------
         try:
+            self.track_request(request.uid, worker_id)
             response = worker.process(request)
+            self.untrack_request(request.uid)
             elapsed = time.time() - dispatch_time
 
             with self._lock:
@@ -370,6 +387,7 @@ class LoadBalancer:
             return response
 
         except Exception as exc:
+            self.untrack_request(request.uid)
             elapsed = time.time() - dispatch_time
 
             with self._lock:

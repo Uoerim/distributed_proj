@@ -143,6 +143,7 @@ class _RequestRecord:
     completed_at: Optional[float] = None
     worker_id: Optional[int] = None
     status: RequestStatus = RequestStatus.PENDING
+    retry_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +243,7 @@ class Scheduler:
                 self._cache_worker_pool()
                 self._check_worker_health()
                 self._attempt_worker_recovery()
+                self._retry_orphaned_requests()
             except Exception as exc:
                 logger.error("Error in health monitor loop: %s", exc)
             time.sleep(self._check_interval)
@@ -303,6 +305,45 @@ class Scheduler:
             del self._failed_workers[worker_id]
             logger.info("[Health] Worker %d recovered and re-registered. Active: %d", 
                        worker_id, self._lb.worker_count)
+
+    def _retry_orphaned_requests(self) -> None:
+        failed_worker_ids = list(self._failed_workers.keys())
+        
+        for worker_id in failed_worker_ids:
+            orphaned_uids = self._lb.get_requests_on_worker(worker_id)
+            
+            for uid in orphaned_uids:
+                with self._lock:
+                    record = self._registry.get(uid)
+                    if not record:
+                        continue
+                    
+                    if record.retry_count >= 3:
+                        logger.warning("[Fault] Request %d max retries exceeded (3)", record.request.id)
+                        continue
+                    
+                    record.retry_count += 1
+                
+                logger.info("[Fault] Retrying orphaned request %d (retry %d/3)", 
+                           record.request.id, record.retry_count)
+                
+                self._lb.untrack_request(uid)
+                response = self._lb.dispatch(record.request)
+                
+                with self._lock:
+                    record.response = response
+                    record.completed_at = time.time()
+                    record.worker_id = response.worker_id
+                    
+                    if response.success:
+                        record.status = RequestStatus.COMPLETED
+                        record.request.status = RequestStatus.COMPLETED
+                        self._stats.total_completed += 1
+                        self._stats.total_latency += response.latency
+                    else:
+                        record.status = RequestStatus.FAILED
+                        record.request.status = RequestStatus.FAILED
+                        self._stats.total_failed += 1
 
     def get_failed_workers(self) -> Dict[int, float]:
         return dict(self._failed_workers)
