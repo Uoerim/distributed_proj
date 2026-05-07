@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL       = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
 DEFAULT_NUM_PREDICT = 60
-REQUEST_TIMEOUT     = 120
+REQUEST_TIMEOUT     = 500
 
 
 class GPUWorker:

@@ -4,10 +4,10 @@ lb/load_balancer.py
 Production-grade Load Balancer for the Distributed LLM Inference System.
 
 This module is responsible for distributing incoming ``Request`` objects
-across a pool of registered GPU worker nodes.  It currently implements
-**Round Robin** scheduling and exposes well-defined extension points so
-that *Least Connections* and *Load-Aware* strategies can be added in
-later project phases without modifying the core dispatching logic.
+across a pool of registered GPU worker nodes.  It implements
+**Round Robin**, **Least Connections**, and **Load-Aware** scheduling
+strategies, and includes a request staggering mechanism to avoid
+overwhelming ngrok tunnels with burst traffic.
 
 Architecture
 ------------
@@ -40,10 +40,10 @@ Design Decisions
    (Phase 3) will call ``deregister_worker`` when a node is detected
    as unhealthy.
 
-5. **Extensibility Hooks** — ``_select_worker_least_connections`` and
-   ``_select_worker_load_aware`` are implemented as stubs that raise
-   ``NotImplementedError`` with descriptive messages, signalling to
-   the team exactly where to plug in the next-phase logic.
+5. **Request Staggering** — ``dispatch_staggered`` introduces a small
+   configurable delay between consecutive dispatches to avoid exceeding
+   ngrok free-tier rate limits (~20 req/min per tunnel) when running
+   large load tests across remote workers.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 # Worker Protocol – structural typing for worker nodes
 # ---------------------------------------------------------------------------
 
+
 @runtime_checkable
 class WorkerNode(Protocol):
     """Minimal interface that any GPU worker must satisfy.
@@ -81,10 +82,15 @@ class WorkerNode(Protocol):
     def process(self, request: Request) -> Response:  # pragma: no cover
         ...
 
+    def get_load(self) -> float:  # pragma: no cover
+        """Return normalised load metric (0.0 = idle, 1.0 = saturated)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Load-Balancer Statistics
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LoadBalancerStats:
@@ -133,15 +139,12 @@ class LoadBalancerStats:
 
 
 # ---------------------------------------------------------------------------
-# Connection Tracker (for Least-Connections – Phase 3)
+# Connection Tracker (for Least-Connections)
 # ---------------------------------------------------------------------------
 
-class _ConnectionTracker:
-    """Tracks the number of in-flight (active) connections per worker.
 
-    This is instantiated internally by ``LoadBalancer`` and will be
-    used once *Least Connections* routing is implemented.
-    """
+class _ConnectionTracker:
+    """Tracks the number of in-flight (active) connections per worker."""
 
     def __init__(self) -> None:
         self._counts: Dict[int, int] = defaultdict(int)
@@ -166,6 +169,7 @@ class _ConnectionTracker:
 # Main LoadBalancer Class
 # ---------------------------------------------------------------------------
 
+
 class LoadBalancer:
     """Distributes incoming requests across a pool of GPU worker nodes.
 
@@ -176,6 +180,10 @@ class LoadBalancer:
     strategy : RoutingStrategy
         Algorithm used to select the next worker.  Defaults to
         ``RoutingStrategy.ROUND_ROBIN``.
+    stagger_delay : float
+        Seconds to wait between consecutive dispatches in
+        ``dispatch_staggered``.  Default is 0.1s (10 req/s burst cap).
+        Set to 0.0 to disable staggering entirely.
 
     Examples
     --------
@@ -194,20 +202,22 @@ class LoadBalancer:
         self,
         workers: List[WorkerNode],
         strategy: RoutingStrategy = RoutingStrategy.ROUND_ROBIN,
+        stagger_delay: float = 0.1,
     ) -> None:
         if not workers:
             raise ValueError("LoadBalancer requires at least one worker node.")
 
         self._workers: List[WorkerNode] = list(workers)
         self._strategy: RoutingStrategy = strategy
+        self._stagger_delay: float = stagger_delay
 
         # Round-Robin state
         self._rr_index: int = 0
 
-        # Connection tracking (Least-Connections, Phase 3)
+        # Connection tracking (Least-Connections)
         self._connections = _ConnectionTracker()
 
-        # Request tracking for fault tolerance (Phase 3)
+        # Request tracking for fault tolerance
         self._request_to_worker: Dict[str, int] = {}
 
         # Thread safety
@@ -227,11 +237,7 @@ class LoadBalancer:
     # ------------------------------------------------------------------ #
 
     def register_worker(self, worker: WorkerNode) -> None:
-        """Add a worker to the active pool at runtime.
-
-        This is intended for auto-scaling scenarios and for the
-        fault-tolerance module to re-register recovered nodes.
-        """
+        """Add a worker to the active pool at runtime."""
         with self._lock:
             if any(w.id == worker.id for w in self._workers):
                 logger.warning("Worker %d is already registered – skipping.", worker.id)
@@ -255,7 +261,6 @@ class LoadBalancer:
                 if w.id == worker_id:
                     removed = self._workers.pop(idx)
                     self._connections.remove(worker_id)
-                    # Adjust round-robin index to avoid skipping workers
                     if self._rr_index >= len(self._workers) and self._workers:
                         self._rr_index = 0
                     logger.info(
@@ -296,13 +301,7 @@ class LoadBalancer:
     # ------------------------------------------------------------------ #
 
     def set_strategy(self, strategy: RoutingStrategy) -> None:
-        """Switch the routing strategy at runtime.
-
-        Parameters
-        ----------
-        strategy : RoutingStrategy
-            The new strategy to use for subsequent dispatches.
-        """
+        """Switch the routing strategy at runtime."""
         with self._lock:
             old = self._strategy
             self._strategy = strategy
@@ -324,28 +323,13 @@ class LoadBalancer:
     def dispatch(self, request: Request) -> Response:
         """Select a worker and forward *request* for processing.
 
-        This is the primary entry-point called by the ``Scheduler``.
-        It performs the following steps:
-
+        Steps:
         1. Select a worker using the active routing strategy.
-        2. Increment in-flight connection counter (for future LC use).
-        3. Delegate ``request`` to the selected worker's ``process()``
-           method.
+        2. Increment in-flight connection counter.
+        3. Delegate ``request`` to the selected worker's ``process()``.
         4. Record success/failure and latency in ``_stats``.
         5. Return the ``Response`` to the caller.
-
-        Parameters
-        ----------
-        request : Request
-            The incoming request to be processed.
-
-        Returns
-        -------
-        Response
-            The worker's response, or a synthetic error ``Response``
-            if the worker raised an exception.
         """
-        # --- Select worker (thread-safe) ---------------------------------
         with self._lock:
             if not self._workers:
                 raise RuntimeError("No workers available in the pool.")
@@ -365,7 +349,6 @@ class LoadBalancer:
             self._strategy.value,
         )
 
-        # --- Forward to worker -------------------------------------------
         try:
             self.track_request(request.uid, worker_id)
             response = worker.process(request)
@@ -403,8 +386,6 @@ class LoadBalancer:
                 exc,
             )
 
-            # Return a synthetic error response so the caller never
-            # receives an unhandled exception from the balancer layer.
             return Response(
                 id=request.id,
                 request_uid=request.uid,
@@ -413,6 +394,41 @@ class LoadBalancer:
                 worker_id=worker_id,
                 success=False,
             )
+
+    def dispatch_staggered(self, request: Request) -> Response:
+        """Dispatch with a pre-sleep delay to avoid ngrok rate limiting.
+
+        Identical to ``dispatch`` but sleeps for ``self._stagger_delay``
+        seconds before forwarding the request.  Use this in the load
+        generator when running large tests (250+ users) against remote
+        ngrok-tunnelled workers to stay under the free-tier rate limit
+        of ~20 requests/minute per tunnel.
+
+        Parameters
+        ----------
+        request : Request
+            The incoming request to be processed.
+
+        Returns
+        -------
+        Response
+            Same as ``dispatch``.
+
+        Example
+        -------
+        In ``client/load_generator.py``, replace::
+
+            response = scheduler.dispatch(request)
+
+        with::
+
+            response = scheduler.dispatch_staggered(request)
+
+        Or set ``stagger_delay=0.0`` to fall back to instant dispatch.
+        """
+        if self._stagger_delay > 0.0:
+            time.sleep(self._stagger_delay)
+        return self.dispatch(request)
 
     # ------------------------------------------------------------------ #
     #  Worker-Selection Strategies (private)
@@ -443,55 +459,74 @@ class LoadBalancer:
         self._rr_index = (self._rr_index + 1) % len(self._workers)
         return worker
 
-    # -- Least Connections (Phase 3 – stub) ------------------------------
+    # -- Least Connections (Phase 3 – implemented) ----------------------
 
     def _select_worker_least_connections(self) -> WorkerNode:
         """Select the worker with the fewest in-flight connections.
 
-        .. note:: Phase 3 stub — connection tracking infrastructure is
-           already in place via ``_ConnectionTracker``.  The implementing
-           team member should:
+        Iterates all workers and picks the one with the minimum active
+        connection count.  Ties are broken by worker id for determinism.
 
-           1. Iterate ``self._workers``.
-           2. For each worker, call ``self._connections.get(w.id)``.
-           3. Return the worker with the minimum count (break ties by
-              worker id for determinism).
-
-        Raises
-        ------
-        NotImplementedError
-            Until Phase 3 implementation is merged.
+        Time complexity: O(n).
         """
-        raise NotImplementedError(
-            "Least-Connections routing is scheduled for Phase 3.  "
-            "Connection tracking infrastructure is ready in _ConnectionTracker."
-        )
+        best_worker = self._workers[0]
+        best_count = self._connections.get(best_worker.id)
 
-    # -- Load-Aware (Phase 3 – stub) ------------------------------------
+        for w in self._workers[1:]:
+            count = self._connections.get(w.id)
+            if count < best_count or (count == best_count and w.id < best_worker.id):
+                best_worker = w
+                best_count = count
+
+        logger.debug(
+            "[LB] Least-Connections selected Worker %d  (active=%d)",
+            best_worker.id,
+            best_count,
+        )
+        return best_worker
+
+    # -- Load-Aware (Phase 3 – implemented) -----------------------------
 
     def _select_worker_load_aware(self) -> WorkerNode:
         """Select the worker with the lowest reported system load.
 
-        .. note:: Phase 3 stub — requires each ``WorkerNode`` to
-           expose a ``get_load() -> float`` method returning a
-           normalised load metric (0.0 = idle, 1.0 = saturated).
+        Calls ``w.get_load()`` on every worker in the pool and returns
+        the one with the minimum value.  If all workers report a load
+        above 0.95 (saturated), logs a warning and falls back to
+        Round Robin to avoid stalling the request.
 
-           The implementing team member should:
+        Each ``WorkerNode`` must implement ``get_load() -> float``
+        returning a normalised metric where 0.0 = idle, 1.0 = saturated.
 
-           1. Call ``w.get_load()`` for every worker in the pool.
-           2. Return the worker with the minimum load value.
-           3. Optionally apply a threshold: if *all* workers exceed
-              ``0.95`` load, log a warning and fall back to Round Robin.
-
-        Raises
-        ------
-        NotImplementedError
-            Until Phase 3 implementation is merged.
+        Time complexity: O(n).
         """
-        raise NotImplementedError(
-            "Load-Aware routing is scheduled for Phase 3.  "
-            "Workers must implement get_load() -> float to enable this."
+        SATURATION_THRESHOLD = 0.95
+
+        loads: List[tuple[float, WorkerNode]] = []
+        for w in self._workers:
+            try:
+                load = w.get_load()
+            except (AttributeError, NotImplementedError):
+                # Worker does not implement get_load() — treat as 0.0
+                load = 0.0
+            loads.append((load, w))
+
+        min_load, best_worker = min(loads, key=lambda x: (x[0], x[1].id))
+
+        if min_load >= SATURATION_THRESHOLD:
+            logger.warning(
+                "[LB] All workers saturated (min load=%.2f) — "
+                "falling back to Round Robin.",
+                min_load,
+            )
+            return self._select_worker_round_robin()
+
+        logger.debug(
+            "[LB] Load-Aware selected Worker %d  (load=%.2f)",
+            best_worker.id,
+            min_load,
         )
+        return best_worker
 
     # ------------------------------------------------------------------ #
     #  Observability / Reporting
@@ -503,10 +538,7 @@ class LoadBalancer:
         return self._stats
 
     def get_stats_summary(self) -> Dict[str, Any]:
-        """Return a JSON-serialisable snapshot of all metrics.
-
-        Thread-safe: reads are performed under the lock.
-        """
+        """Return a JSON-serialisable snapshot of all metrics."""
         with self._lock:
             summary = self._stats.summary()
             summary["active_connections"] = self._connections.snapshot()

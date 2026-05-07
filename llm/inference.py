@@ -36,8 +36,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL       = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
 DEFAULT_NUM_PREDICT = 60
-DEFAULT_TIMEOUT     = 300
-
+DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT", 300))
 
 def run_inference(
     prompt: str,
