@@ -10,7 +10,7 @@ Its responsibilities include:
 * Accepting requests from the client layer.
 * Validating and enriching requests before dispatch.
 * Delegating worker selection to the ``LoadBalancer``.
-* Tracking per-request lifecycle (pending → dispatched → completed/failed).
+* Tracking per-request lifecycle (pending -> dispatched -> completed/failed).
 * Maintaining aggregate success/failure counters and latency statistics.
 * Providing an observability API for the monitoring dashboard.
 * Supporting both synchronous and asynchronous (batch) dispatch modes.
@@ -19,37 +19,52 @@ Architecture
 ------------
 ::
 
-    ┌──────────┐     ┌────────────────┐     ┌──────────────┐     ┌──────────┐
-    │  Client  │────▶│   Scheduler    │────▶│ LoadBalancer  │────▶│ Workers  │
-    │  Layer   │◀────│  (this module) │◀────│              │◀────│          │
-    └──────────┘     └────────────────┘     └──────────────┘     └──────────┘
+    +-----------+     +----------------+     +--------------+     +----------+
+    |  Client   |---->|   Scheduler    |---->| LoadBalancer  |---->| Workers  |
+    |  Layer    |<----|  (this module) |<----|              |<----+          |
+    +-----------+     +----------------+     +--------------+     +----------+
 
 Design Decisions
 ----------------
-1. **Single Responsibility** — The Scheduler handles *orchestration*
+1. **Single Responsibility** -- The Scheduler handles *orchestration*
    (validation, lifecycle, stats).  It never touches worker-selection
-   logic — that is entirely the Load Balancer's job.
+   logic -- that is entirely the Load Balancer's job.
 
-2. **Thread Safety** — All shared state is guarded by a
+2. **Thread Safety** -- All shared state is guarded by a
    ``threading.Lock`` so the scheduler is safe for concurrent use
    from the load-test harness.
 
-3. **Request Registry** — A lightweight in-memory dict maps every
+3. **Request Registry** -- A lightweight in-memory dict maps every
    ``request.uid`` to its ``Response`` (or ``None`` while in-flight).
    This enables the fault-tolerance module (Phase 3) to detect
    orphaned requests and re-dispatch them.
 
-4. **Batch Dispatch** — ``handle_batch()`` processes a list of
+4. **Batch Dispatch** -- ``handle_batch()`` processes a list of
    requests sequentially (or could be made parallel later) and
    returns aggregated results, which is useful for throughput
    benchmarks.
 
-5. **Callbacks** — An optional ``on_complete`` callback list lets
+5. **Callbacks** -- An optional ``on_complete`` callback list lets
    other modules (monitoring, logging, metrics exporters) subscribe
    to dispatch events without tight coupling.
+
+Phase 3 changes
+---------------
+* ``max_retries`` default raised from 0 -> 3 so orphaned requests are
+  automatically re-dispatched on worker failure.
+* ``_retry_orphaned_requests`` now marks requests as FAILED (and stops
+  retrying) once ``max_retries`` is exhausted, preventing infinite loops.
+* ``print_report`` waits up to 10 s for all in-flight requests to settle
+  before snapshotting counters so the printed numbers add up correctly.
+* A new "FAILED / DEREGISTERED WORKERS" section is appended to the
+  report when the health monitor has removed nodes from the pool.
+* A retry-inflation note is printed when LB dispatches > requests
+  received, so it is clear the difference is retries -- not a bug.
 """
 
+
 from __future__ import annotations
+
 
 import logging
 import threading
@@ -57,8 +72,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+
 from common.models import Request, RequestStatus, Response, RoutingStrategy
 from lb.load_balancer import LoadBalancer
+
 
 # ---------------------------------------------------------------------------
 # Module-level logger
@@ -70,6 +87,7 @@ logger = logging.getLogger(__name__)
 # Scheduler Statistics
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SchedulerStats:
     """Aggregate metrics tracked by the Scheduler.
@@ -77,15 +95,17 @@ class SchedulerStats:
     All fields are updated under the parent ``Scheduler._lock``.
     """
 
-    total_received: int = 0
-    total_dispatched: int = 0
-    total_completed: int = 0
-    total_failed: int = 0
-    total_latency: float = 0.0
+    total_received:   int   = 0
+    total_dispatched: int   = 0
+    total_completed:  int   = 0
+    total_failed:     int   = 0
+    total_latency:    float = 0.0
 
     # Timestamps for uptime / throughput calculation
     first_request_at: Optional[float] = None
-    last_request_at: Optional[float] = None
+    last_request_at:  Optional[float] = None
+
+    # -- Derived metrics -------------------------------------------------
 
     @property
     def average_latency(self) -> float:
@@ -96,7 +116,7 @@ class SchedulerStats:
 
     @property
     def success_rate(self) -> float:
-        """Fraction of dispatched requests that succeeded (0.0 – 1.0)."""
+        """Fraction of dispatched requests that succeeded (0.0 - 1.0)."""
         dispatched = self.total_completed + self.total_failed
         if dispatched == 0:
             return 0.0
@@ -119,13 +139,13 @@ class SchedulerStats:
     def summary(self) -> Dict[str, Any]:
         """Return a JSON-serialisable snapshot of all scheduler metrics."""
         return {
-            "total_received": self.total_received,
-            "total_dispatched": self.total_dispatched,
-            "total_completed": self.total_completed,
-            "total_failed": self.total_failed,
-            "success_rate": round(self.success_rate, 4),
+            "total_received":    self.total_received,
+            "total_dispatched":  self.total_dispatched,
+            "total_completed":   self.total_completed,
+            "total_failed":      self.total_failed,
+            "success_rate":      round(self.success_rate, 4),
             "average_latency_s": round(self.average_latency, 6),
-            "throughput_rps": round(self.throughput, 2),
+            "throughput_rps":    round(self.throughput, 2),
         }
 
 
@@ -133,22 +153,24 @@ class SchedulerStats:
 # Request Registry Entry
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _RequestRecord:
     """Internal bookkeeping for a single request's lifecycle."""
 
-    request: Request
-    response: Optional[Response] = None
-    dispatched_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    worker_id: Optional[int] = None
-    status: RequestStatus = RequestStatus.PENDING
-    retry_count: int = 0
+    request:       Request
+    response:      Optional[Response]  = None
+    dispatched_at: Optional[float]     = None
+    completed_at:  Optional[float]     = None
+    worker_id:     Optional[int]       = None
+    status:        RequestStatus       = RequestStatus.PENDING
+    retry_count:   int                 = 0
 
 
 # ---------------------------------------------------------------------------
 # Main Scheduler Class
 # ---------------------------------------------------------------------------
+
 
 class Scheduler:
     """Central orchestrator that receives requests and coordinates dispatch.
@@ -158,9 +180,8 @@ class Scheduler:
     load_balancer : LoadBalancer
         The load-balancer instance responsible for worker selection.
     max_retries : int
-        Number of automatic retry attempts on worker failure (0 = no retry).
-        Full retry logic is a Phase 3 deliverable; the parameter is
-        accepted now so the interface is stable.
+        Number of automatic retry attempts on worker failure.
+        Defaults to 3 (Phase 3).  Set to 0 to disable retries.
 
     Examples
     --------
@@ -179,10 +200,10 @@ class Scheduler:
     def __init__(
         self,
         load_balancer: LoadBalancer,
-        max_retries: int = 0,
+        max_retries: int = 3,           # Phase 3: raised from 0 -> 3
     ) -> None:
-        self._lb: LoadBalancer = load_balancer
-        self._max_retries: int = max_retries
+        self._lb:          LoadBalancer = load_balancer
+        self._max_retries: int          = max_retries
 
         # Thread safety
         self._lock = threading.Lock()
@@ -193,15 +214,15 @@ class Scheduler:
         # Request lifecycle tracking  {request_uid: _RequestRecord}
         self._registry: Dict[str, _RequestRecord] = {}
 
-        # Event callbacks – invoked after every dispatch completes
+        # Event callbacks - invoked after every dispatch completes
         self._on_complete_callbacks: List[Callable[[Request, Response], None]] = []
 
         # Health monitoring (Phase 3 - Fault Tolerance)
-        self._health_monitor_thread: Optional[threading.Thread] = None
-        self._monitor_active: bool = False
-        self._failed_workers: Dict[int, float] = {}
-        self._worker_pool_cache: Dict[int, Any] = {}
-        self._check_interval: float = 2.0
+        self._health_monitor_thread:   Optional[threading.Thread] = None
+        self._monitor_active:          bool            = False
+        self._failed_workers:          Dict[int, float] = {}
+        self._worker_pool_cache:       Dict[int, Any]   = {}
+        self._check_interval:          float = 2.0
         self._recovery_retry_interval: float = 10.0
 
         logger.info(
@@ -214,17 +235,21 @@ class Scheduler:
     #  Health Monitoring (Phase 3 - Fault Tolerance)
     # ------------------------------------------------------------------ #
 
-    def start_health_monitor(self, check_interval: float = 2.0, recovery_retry_interval: float = 10.0) -> None:
+    def start_health_monitor(
+        self,
+        check_interval: float = 2.0,
+        recovery_retry_interval: float = 10.0,
+    ) -> None:
         if self._monitor_active:
             logger.warning("Health monitor already running.")
             return
-        self._monitor_active = True
-        self._check_interval = check_interval
+        self._monitor_active          = True
+        self._check_interval          = check_interval
         self._recovery_retry_interval = recovery_retry_interval
-        self._health_monitor_thread = threading.Thread(
+        self._health_monitor_thread   = threading.Thread(
             target=self._health_monitor_loop,
             daemon=True,
-            name="SchedulerHealthMonitor"
+            name="SchedulerHealthMonitor",
         )
         self._health_monitor_thread.start()
         logger.info("Health monitor started (interval=%.1fs)", check_interval)
@@ -260,7 +285,7 @@ class Scheduler:
     def _check_worker_health(self) -> None:
         with self._lock:
             active_worker_ids = list(self._lb.worker_ids)
-        
+
         for worker_id in active_worker_ids:
             if worker_id in self._worker_pool_cache:
                 worker = self._worker_pool_cache[worker_id]
@@ -268,13 +293,15 @@ class Scheduler:
                     if not worker.is_healthy():
                         self._fail_worker(worker_id)
                 except Exception as exc:
-                    logger.warning("Health check failed for worker %d: %s", worker_id, exc)
+                    logger.warning(
+                        "Health check failed for worker %d: %s", worker_id, exc
+                    )
                     self._fail_worker(worker_id)
 
     def _attempt_worker_recovery(self) -> None:
-        now = time.time()
+        now        = time.time()
         failed_ids = list(self._failed_workers.keys())
-        
+
         for worker_id in failed_ids:
             time_failed = self._failed_workers[worker_id]
             if now - time_failed >= self._recovery_retry_interval:
@@ -284,7 +311,9 @@ class Scheduler:
                         if worker.is_healthy():
                             self._recover_worker(worker_id)
                     except Exception as exc:
-                        logger.debug("Recovery check failed for worker %d: %s", worker_id, exc)
+                        logger.debug(
+                            "Recovery check failed for worker %d: %s", worker_id, exc
+                        )
 
     def _fail_worker(self, worker_id: int) -> None:
         if worker_id in self._failed_workers:
@@ -292,8 +321,11 @@ class Scheduler:
         with self._lock:
             self._lb.deregister_worker(worker_id)
         self._failed_workers[worker_id] = time.time()
-        logger.warning("[Health] Worker %d failed and deregistered. Remaining: %d", 
-                      worker_id, self._lb.worker_count)
+        logger.warning(
+            "[Health] Worker %d failed and deregistered. Remaining: %d",
+            worker_id,
+            self._lb.worker_count,
+        )
 
     def _recover_worker(self, worker_id: int) -> None:
         if worker_id not in self._failed_workers:
@@ -303,45 +335,69 @@ class Scheduler:
             with self._lock:
                 self._lb.register_worker(worker)
             del self._failed_workers[worker_id]
-            logger.info("[Health] Worker %d recovered and re-registered. Active: %d", 
-                       worker_id, self._lb.worker_count)
+            logger.info(
+                "[Health] Worker %d recovered and re-registered. Active: %d",
+                worker_id,
+                self._lb.worker_count,
+            )
 
     def _retry_orphaned_requests(self) -> None:
+        """Re-dispatch requests that were in-flight on a failed worker.
+
+        Phase 3 change: once ``retry_count`` reaches ``max_retries`` the
+        request is marked FAILED and removed from the tracker so it does
+        not loop forever.
+        """
         failed_worker_ids = list(self._failed_workers.keys())
-        
+
         for worker_id in failed_worker_ids:
             orphaned_uids = self._lb.get_requests_on_worker(worker_id)
-            
+
             for uid in orphaned_uids:
                 with self._lock:
                     record = self._registry.get(uid)
                     if not record:
                         continue
-                    
-                    if record.retry_count >= 3:
-                        logger.warning("[Fault] Request %d max retries exceeded (3)", record.request.id)
+
+                    if record.retry_count >= self._max_retries:
+                        logger.warning(
+                            "[Fault] Request %d max retries exceeded (%d)",
+                            record.request.id,
+                            self._max_retries,
+                        )
+                        # Permanently mark as failed -- stop retrying
+                        record.status         = RequestStatus.FAILED
+                        record.request.status = RequestStatus.FAILED
+                        self._stats.total_failed += 1
+                        self._lb.untrack_request(uid)
                         continue
-                    
+
                     record.retry_count += 1
-                
-                logger.info("[Fault] Retrying orphaned request %d (retry %d/3)", 
-                           record.request.id, record.retry_count)
-                
+                    retry_num = record.retry_count
+
+                logger.info(
+                    "[Fault] Retrying orphaned request %d (retry %d/%d)",
+                    record.request.id,
+                    retry_num,
+                    self._max_retries,
+                )
+
                 self._lb.untrack_request(uid)
                 response = self._lb.dispatch(record.request)
-                
+
                 with self._lock:
-                    record.response = response
+                    record.response     = response
                     record.completed_at = time.time()
-                    record.worker_id = response.worker_id
-                    
+                    record.worker_id    = response.worker_id
+                    self._stats.last_request_at = record.completed_at
+
                     if response.success:
-                        record.status = RequestStatus.COMPLETED
+                        record.status         = RequestStatus.COMPLETED
                         record.request.status = RequestStatus.COMPLETED
                         self._stats.total_completed += 1
-                        self._stats.total_latency += response.latency
+                        self._stats.total_latency   += response.latency
                     else:
-                        record.status = RequestStatus.FAILED
+                        record.status         = RequestStatus.FAILED
                         record.request.status = RequestStatus.FAILED
                         self._stats.total_failed += 1
 
@@ -429,19 +485,19 @@ class Scheduler:
         completed_at = time.time()
 
         with self._lock:
-            record.response = response
+            record.response     = response
             record.completed_at = completed_at
-            record.worker_id = response.worker_id
+            record.worker_id    = response.worker_id
             self._stats.last_request_at = completed_at
 
             if response.success:
-                record.status = RequestStatus.COMPLETED
-                request.status = RequestStatus.COMPLETED
+                record.status         = RequestStatus.COMPLETED
+                request.status        = RequestStatus.COMPLETED
                 self._stats.total_completed += 1
-                self._stats.total_latency += response.latency
+                self._stats.total_latency   += response.latency
             else:
-                record.status = RequestStatus.FAILED
-                request.status = RequestStatus.FAILED
+                record.status         = RequestStatus.FAILED
+                request.status        = RequestStatus.FAILED
                 self._stats.total_failed += 1
 
         # -- Log result ---------------------------------------------------
@@ -519,15 +575,15 @@ class Scheduler:
             if record is None:
                 return None
             return {
-                "request_id": record.request.id,
-                "uid": record.request.uid,
-                "query": record.request.query,
-                "status": record.status.name,
+                "request_id":    record.request.id,
+                "uid":           record.request.uid,
+                "query":         record.request.query,
+                "status":        record.status.name,
                 "dispatched_at": record.dispatched_at,
-                "completed_at": record.completed_at,
-                "worker_id": record.worker_id,
-                "latency": record.response.latency if record.response else None,
-                "success": record.response.success if record.response else None,
+                "completed_at":  record.completed_at,
+                "worker_id":     record.worker_id,
+                "latency":       record.response.latency if record.response else None,
+                "success":       record.response.success if record.response else None,
             }
 
     def get_pending_count(self) -> int:
@@ -588,7 +644,7 @@ class Scheduler:
         lb_metrics = self._lb.get_stats_summary()
 
         return {
-            "scheduler": scheduler_metrics,
+            "scheduler":     scheduler_metrics,
             "load_balancer": lb_metrics,
             "registry_size": len(self._registry),
         }
@@ -604,11 +660,30 @@ class Scheduler:
     def print_report(self) -> None:
         """Print a human-readable performance report to stdout.
 
-        Useful for quick inspection after a benchmark run.
+        Phase 3 change: waits up to 10 s for all in-flight requests
+        (including orphan retries) to settle before snapshotting counters
+        so the printed numbers are consistent.
+
+        Also prints:
+        * A note when LB dispatched > received (retry inflation).
+        * A FAILED / DEREGISTERED WORKERS section when the health
+          monitor has removed nodes from the pool.
         """
+        # Wait for in-flight requests / retries to finish
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            with self._lock:
+                in_flight = sum(
+                    1 for r in self._registry.values()
+                    if r.status in (RequestStatus.PENDING, RequestStatus.DISPATCHED)
+                )
+            if in_flight == 0:
+                break
+            time.sleep(0.5)
+
         summary = self.get_stats_summary()
-        sched = summary["scheduler"]
-        lb = summary["load_balancer"]
+        sched   = summary["scheduler"]
+        lb      = summary["load_balancer"]
 
         border = "=" * 62
         print(f"\n{border}")
@@ -633,15 +708,31 @@ class Scheduler:
         print(f"    Success rate       : {lb['success_rate'] * 100:.2f}%")
         print(f"    Avg latency        : {lb['average_latency_s']:.6f}s")
 
+        # Explain retry inflation so numbers don't look like a bug
+        retries = lb['total_requests'] - sched['total_received']
+        if retries > 0:
+            print(f"    (* {retries} extra dispatch(es) are fault-tolerance retries)")
+
         print("\n  >> PER-WORKER DISPATCH DISTRIBUTION")
         dispatches = lb.get("per_worker_dispatches", {})
-        successes = lb.get("per_worker_successes", {})
-        failures = lb.get("per_worker_failures", {})
+        successes  = lb.get("per_worker_successes", {})
+        failures   = lb.get("per_worker_failures", {})
         for wid in sorted(dispatches.keys()):
             s = successes.get(wid, 0)
             f = failures.get(wid, 0)
-            print(f"    Worker {wid:>3d}  ->  dispatched={dispatches[wid]}  "
-                  f"success={s}  failed={f}")
+            print(
+                f"    Worker {wid:>3d}  ->  dispatched={dispatches[wid]}  "
+                f"success={s}  failed={f}"
+            )
+
+        # Show which workers the health monitor took offline
+        if self._failed_workers:
+            print("\n  >> FAILED / DEREGISTERED WORKERS")
+            for wid, ts in sorted(self._failed_workers.items()):
+                print(
+                    f"    Worker {wid:>3d}  failed at "
+                    f"{time.strftime('%H:%M:%S', time.localtime(ts))}"
+                )
 
         print(f"\n{border}\n")
 
@@ -664,7 +755,7 @@ class Scheduler:
             )
         if not request.query or not request.query.strip():
             raise ValueError(
-                f"Request {request.id} has an empty query — rejecting."
+                f"Request {request.id} has an empty query -- rejecting."
             )
 
     def _fire_callbacks(self, request: Request, response: Response) -> None:
